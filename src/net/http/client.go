@@ -34,6 +34,25 @@ import (
 // A Client is higher-level than a RoundTripper (such as Transport)
 // and additionally handles HTTP details such as cookies and
 // redirects.
+//
+// When following redirects, the Client will forward all headers set on the
+// initial Request except:
+//
+//	* when forwarding sensitive headers like "Authorization",
+//	  "WWW-Authenticate", and "Cookie" to untrusted targets.
+//	  These headers will be ignored when following a redirect to a domain
+//	  that is not a subdomain match or exact match of the initial domain.
+//	  For example, a redirect from "foo.com" to either "foo.com" or "sub.foo.com"
+//	  will forward the sensitive headers, but a redirect to "bar.com" will not.
+//
+//	* when forwarding the "Cookie" header with a non-nil cookie Jar.
+//	  Since each redirect may mutate the state of the cookie jar,
+//	  a redirect may possibly alter a cookie set in the initial request.
+//	  When forwarding the "Cookie" header, any mutated cookies will be omitted,
+//	  with the expectation that the Jar will insert those mutated cookies
+//	  with the updated values (assuming the origin matches).
+//	  If Jar is nil, the initial cookies are forwarded without change.
+//
 type Client struct {
 	// Transport specifies the mechanism by which individual
 	// HTTP requests are made.
@@ -57,8 +76,14 @@ type Client struct {
 	CheckRedirect func(req *Request, via []*Request) error
 
 	// Jar specifies the cookie jar.
-	// If Jar is nil, cookies are not sent in requests and ignored
-	// in responses.
+	//
+	// The Jar is used to insert relevant cookies into every
+	// outbound Request and is updated with the cookie values
+	// of every inbound Response. The Jar is consulted for every
+	// redirect that the Client follows.
+	//
+	// If Jar is nil, cookies are only sent if they are explicitly
+	// set on the Request.
 	Jar CookieJar
 
 	// Timeout specifies a time limit for requests made by this
@@ -138,22 +163,23 @@ func refererForURL(lastReq, newReq *url.URL) string {
 	return referer
 }
 
-func (c *Client) send(req *Request, deadline time.Time) (*Response, error) {
+// didTimeout is non-nil only if err != nil.
+func (c *Client) send(req *Request, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
 	if c.Jar != nil {
 		for _, cookie := range c.Jar.Cookies(req.URL) {
 			req.AddCookie(cookie)
 		}
 	}
-	resp, err := send(req, c.transport(), deadline)
+	resp, didTimeout, err = send(req, c.transport(), deadline)
 	if err != nil {
-		return nil, err
+		return nil, didTimeout, err
 	}
 	if c.Jar != nil {
 		if rc := resp.Cookies(); len(rc) > 0 {
 			c.Jar.SetCookies(req.URL, rc)
 		}
 	}
-	return resp, nil
+	return resp, nil, nil
 }
 
 func (c *Client) deadline() time.Time {
@@ -172,22 +198,22 @@ func (c *Client) transport() RoundTripper {
 
 // send issues an HTTP request.
 // Caller should close resp.Body when done reading from it.
-func send(ireq *Request, rt RoundTripper, deadline time.Time) (*Response, error) {
+func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
 	req := ireq // req is either the original request, or a modified fork
 
 	if rt == nil {
 		req.closeBody()
-		return nil, errors.New("http: no Client.Transport or DefaultTransport")
+		return nil, alwaysFalse, errors.New("http: no Client.Transport or DefaultTransport")
 	}
 
 	if req.URL == nil {
 		req.closeBody()
-		return nil, errors.New("http: nil Request.URL")
+		return nil, alwaysFalse, errors.New("http: nil Request.URL")
 	}
 
 	if req.RequestURI != "" {
 		req.closeBody()
-		return nil, errors.New("http: Request.RequestURI can't be set in client requests.")
+		return nil, alwaysFalse, errors.New("http: Request.RequestURI can't be set in client requests.")
 	}
 
 	// forkReq forks req into a shallow clone of ireq the first
@@ -220,7 +246,7 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (*Response, error)
 	}
 	stopTimer, didTimeout := setRequestCancel(req, rt, deadline)
 
-	resp, err := rt.RoundTrip(req)
+	resp, err = rt.RoundTrip(req)
 	if err != nil {
 		stopTimer()
 		if resp != nil {
@@ -234,7 +260,7 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (*Response, error)
 				err = errors.New("http: server gave HTTP response to HTTPS client")
 			}
 		}
-		return nil, err
+		return nil, didTimeout, err
 	}
 	if !deadline.IsZero() {
 		resp.Body = &cancelTimerBody{
@@ -243,12 +269,17 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (*Response, error)
 			reqDidTimeout: didTimeout,
 		}
 	}
-	return resp, nil
+	return resp, nil, nil
 }
 
 // setRequestCancel sets the Cancel field of req, if deadline is
 // non-zero. The RoundTripper's type is used to determine whether the legacy
 // CancelRequest behavior should be used.
+//
+// As background, there are three ways to cancel a request:
+// First was Transport.CancelRequest. (deprecated)
+// Second was Request.Cancel (this mechanism).
+// Third was Request.Context.
 func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTimer func(), didTimeout func() bool) {
 	if deadline.IsZero() {
 		return nop, alwaysFalse
@@ -260,7 +291,7 @@ func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTi
 	req.Cancel = cancel
 
 	doCancel := func() {
-		// The new way:
+		// The newer way (the second way in the func comment):
 		close(cancel)
 
 		// The legacy compatibility way, used only
@@ -540,8 +571,9 @@ func (c *Client) Do(req *Request) (*Response, error) {
 
 		reqs = append(reqs, req)
 		var err error
-		if resp, err = c.send(req, deadline); err != nil {
-			if !deadline.IsZero() && !time.Now().Before(deadline) {
+		var didTimeout func() bool
+		if resp, didTimeout, err = c.send(req, deadline); err != nil {
+			if !deadline.IsZero() && didTimeout() {
 				err = &httpError{
 					err:     err.Error() + " (Client.Timeout exceeded while awaiting headers)",
 					timeout: true,

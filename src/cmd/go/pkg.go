@@ -178,7 +178,9 @@ func (p *Package) copyBuild(pp *build.Package) {
 	p.CgoCXXFLAGS = pp.CgoCXXFLAGS
 	p.CgoLDFLAGS = pp.CgoLDFLAGS
 	p.CgoPkgConfig = pp.CgoPkgConfig
-	p.Imports = pp.Imports
+	// We modify p.Imports in place, so make copy now.
+	p.Imports = make([]string, len(pp.Imports))
+	copy(p.Imports, pp.Imports)
 	p.TestGoFiles = pp.TestGoFiles
 	p.TestImports = pp.TestImports
 	p.XTestGoFiles = pp.XTestGoFiles
@@ -371,10 +373,8 @@ func loadImport(path, srcDir string, parent *Package, stk *importStack, importPo
 			err = fmt.Errorf("code in directory %s expects import %q", bp.Dir, bp.ImportComment)
 		}
 		p.load(stk, bp, err)
-		if p.Error != nil && p.Error.Pos == "" && len(importPos) > 0 {
-			pos := importPos[0]
-			pos.Filename = shortPath(pos.Filename)
-			p.Error.Pos = pos.String()
+		if p.Error != nil && p.Error.Pos == "" {
+			p = setErrorPos(p, importPos)
 		}
 
 		if origPath != cleanImport(origPath) {
@@ -388,11 +388,11 @@ func loadImport(path, srcDir string, parent *Package, stk *importStack, importPo
 
 	// Checked on every import because the rules depend on the code doing the importing.
 	if perr := disallowInternal(srcDir, p, stk); perr != p {
-		return perr
+		return setErrorPos(perr, importPos)
 	}
 	if mode&useVendor != 0 {
 		if perr := disallowVendor(srcDir, origPath, p, stk); perr != p {
-			return perr
+			return setErrorPos(perr, importPos)
 		}
 	}
 
@@ -402,12 +402,7 @@ func loadImport(path, srcDir string, parent *Package, stk *importStack, importPo
 			ImportStack: stk.copy(),
 			Err:         fmt.Sprintf("import %q is a program, not an importable package", path),
 		}
-		if len(importPos) > 0 {
-			pos := importPos[0]
-			pos.Filename = shortPath(pos.Filename)
-			perr.Error.Pos = pos.String()
-		}
-		return &perr
+		return setErrorPos(&perr, importPos)
 	}
 
 	if p.local && parent != nil && !parent.local {
@@ -416,14 +411,18 @@ func loadImport(path, srcDir string, parent *Package, stk *importStack, importPo
 			ImportStack: stk.copy(),
 			Err:         fmt.Sprintf("local import %q in non-local package", path),
 		}
-		if len(importPos) > 0 {
-			pos := importPos[0]
-			pos.Filename = shortPath(pos.Filename)
-			perr.Error.Pos = pos.String()
-		}
-		return &perr
+		return setErrorPos(&perr, importPos)
 	}
 
+	return p
+}
+
+func setErrorPos(p *Package, importPos []token.Position) *Package {
+	if len(importPos) > 0 {
+		pos := importPos[0]
+		pos.Filename = shortPath(pos.Filename)
+		p.Error.Pos = pos.String()
+	}
 	return p
 }
 
